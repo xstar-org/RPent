@@ -229,11 +229,39 @@ class EnvState:
                 if isinstance(value, (bytes, bytearray, memoryview)):
                     temporary.write_bytes(bytes(value))
                 else:
-                    imageio.mimwrite(
-                        temporary,
-                        list(value),
-                        fps=int(options.get("fps", 20)),
-                    )
+                    frames = [np.asarray(frame) for frame in value]
+                    fps = int(options.get("fps", 20))
+                    try:
+                        imageio.mimwrite(temporary, frames, fps=fps)
+                    except (ImportError, RuntimeError, TypeError, ValueError):
+                        import cv2
+
+                        if not frames:
+                            raise ValueError("video requires at least one frame")
+                        first = frames[0]
+                        if first.ndim != 3 or first.shape[2] not in (3, 4):
+                            raise ValueError(f"invalid video frame shape: {first.shape}")
+                        height, width = first.shape[:2]
+                        writer = cv2.VideoWriter(
+                            str(temporary),
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            fps,
+                            (width, height),
+                        )
+                        if not writer.isOpened():
+                            raise RuntimeError("OpenCV could not open MP4 writer")
+                        try:
+                            for frame in frames:
+                                if frame.shape[:2] != (height, width):
+                                    raise ValueError("video frames have inconsistent sizes")
+                                array = frame.astype(np.uint8, copy=False)
+                                if array.shape[2] == 4:
+                                    array = array[:, :, :3]
+                                writer.write(cv2.cvtColor(array, cv2.COLOR_RGB2BGR))
+                        finally:
+                            writer.release()
+                        if not temporary.exists() or temporary.stat().st_size == 0:
+                            raise RuntimeError("OpenCV produced an empty MP4")
             elif suffix in _TEXT_SUFFIXES:
                 temporary.write_text(str(value))
             elif suffix == ".bin":

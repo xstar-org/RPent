@@ -22,6 +22,7 @@ during ``__init__`` via :meth:`Toolkit.add_tool`; the planner calls the tools th
 from __future__ import annotations
 
 import base64
+import io
 import json
 import threading
 import time
@@ -105,7 +106,7 @@ class ToolResult:
     is_finish: bool = field(default=False, init=False)
 
     #: Max bytes of the text block emitted in :attr:`content_blocks`.
-    MAX_TEXT_BYTES_IN_RESULT: ClassVar[int] = 60000
+    MAX_TEXT_BYTES_IN_RESULT: ClassVar[int] = 12000
 
     def __post_init__(self) -> None:
         self.content_blocks = self._build_content_blocks()
@@ -147,26 +148,24 @@ class ToolResult:
         blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
 
         def _add_image_bytes(data_bytes: bytes) -> None:
-            data = base64.b64encode(data_bytes).decode("utf-8")
-            blocks.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": data,
-                    },
-                }
-            )
+            try:
+                from PIL import Image
+                with Image.open(io.BytesIO(data_bytes)) as source:
+                    image = source.convert("RGB")
+                    image.thumbnail((512, 512))
+                    encoded = io.BytesIO()
+                    image.save(encoded, format="JPEG", quality=70, optimize=True)
+                data = base64.b64encode(encoded.getvalue()).decode("ascii")
+            except Exception:
+                return
+            if len(data) <= 90000:
+                blocks.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}})
 
-        if image:
-            _add_image_bytes(image)
-        if image_cam:
-            _add_image_bytes(image_cam)
-        if image_nav:
-            _add_image_bytes(image_nav)
-        if image_wrist:
-            _add_image_bytes(image_wrist)
+        if self.name == "view_env_state":
+            for candidate in (image, image_cam, image_nav, image_wrist):
+                if candidate:
+                    _add_image_bytes(candidate)
+                    break
         return blocks
 
 

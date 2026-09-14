@@ -176,3 +176,9 @@ class Pi05VLAClient(BaseVLAClient):
         openpi_obs = self.encode_obs(env_obs)
         actions = super().predict(openpi_obs, options)
         return np.asarray(actions)[0]
+
+
+def _release_vla(self) -> None:
+    self._client.call("vla.unload", kwargs={}, timeout_s=self._TIMEOUT_S["default"])
+
+Pi05VLAClient.unload = _release_vla

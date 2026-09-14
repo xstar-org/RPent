@@ -22,12 +22,13 @@ selected by the ``--embodiment`` CLI flag and looked up in
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import os
 import time
+import threading
 from typing import Any
 
 import numpy as np
-import torch
 from omegaconf import OmegaConf
 
 from rpent.robots.components.vla_facade_base import BaseVLAFacade
@@ -110,15 +111,50 @@ def build_model_cfg(model_path: str, emb_cfg: dict) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _pi05_worker(model_path: str, embodiment: str, connection) -> None:
+    """Own one Pi0.5 CUDA model until the RPC parent requests shutdown."""
+    try:
+        import torch
+        from rlinf.models.embodiment.openpi import get_model as get_openpi_model
+
+        cfg = build_model_cfg(
+            model_path=model_path,
+            emb_cfg=PI05_EMBODIMENTS[embodiment],
+        )
+        started = time.time()
+        model = get_openpi_model(cfg, torch_dtype=None).cuda().eval()
+        logger.info("Pi0.5 model ready in %.1fs", time.time() - started)
+        connection.send(("ready", None))
+        while True:
+            command, payload = connection.recv()
+            if command == "stop":
+                return
+            if command != "predict":
+                raise ValueError(f"unknown Pi0.5 worker command: {command}")
+            obs, mode = payload
+            with torch.no_grad():
+                actions, _ = model.predict_action_batch(obs, mode=mode)
+            array = (
+                actions.detach().cpu().numpy()
+                if all(hasattr(actions, name) for name in ("detach", "cpu", "numpy"))
+                else np.asarray(actions)
+            ).astype(np.float32)
+            connection.send(("ok", array))
+    except EOFError:
+        return
+    except BaseException as exc:
+        try:
+            connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        connection.close()
+
+
 class Pi05VLAFacade(BaseVLAFacade):
-    """Pi0.5 VLA inference backed by an openpi model.
+    """Pi0.5 RPC facade with a disposable CUDA worker process."""
 
-    Wires ``vla.predict`` to :meth:`predict` (registered by the base class).
-    Embodiment-specific behavior (model config, obs decode) is driven by
-    the ``embodiment`` name passed at construction.
-
-    Session-isolation is not supported (``reset_session`` is not registered).
-    """
+    _WORKER_TIMEOUT_S = 115.0
 
     def __init__(self, *, model_path: str, embodiment: str):
         if embodiment not in PI05_EMBODIMENTS:
@@ -126,46 +162,78 @@ class Pi05VLAFacade(BaseVLAFacade):
                 f"unknown pi05 server embodiment: {embodiment!r}; "
                 f"registered={list(PI05_EMBODIMENTS)}"
             )
-        emb_cfg = PI05_EMBODIMENTS[embodiment]
+        self._model_path = model_path
         self._embodiment = embodiment
-        super().__init__()
-
-        from rlinf.models.embodiment.openpi import get_model as get_openpi_model
-
+        self._worker = None
+        self._connection = None
+        self._worker_lock = threading.Lock()
+        self._process_context = multiprocessing.get_context("spawn")
         platform = PI05_ROBOT_PLATFORMS.get(embodiment)
         if platform is not None:
             os.environ.setdefault("ROBOT_PLATFORM", platform)
+        logger.info("Pi0.5 worker configured (embodiment=%s, model_path=%s)", embodiment, model_path)
+        super().__init__()
 
-        cfg = build_model_cfg(model_path=model_path, emb_cfg=emb_cfg)
-        t0 = time.time()
-        logger.info(
-            "loading Pi0.5 (embodiment=%s, model_path=%s) ...",
-            embodiment,
-            cfg["model_path"],
+    def _stop_worker_locked(self) -> None:
+        process, connection = self._worker, self._connection
+        self._worker = None
+        self._connection = None
+        if connection is not None:
+            try:
+                connection.send(("stop", None))
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            connection.close()
+        if process is not None:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    def _ensure_worker_locked(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._stop_worker_locked()
+        parent, child = self._process_context.Pipe(duplex=True)
+        process = self._process_context.Process(
+            target=_pi05_worker,
+            args=(self._model_path, self._embodiment, child),
+            daemon=True,
         )
-        self._model = get_openpi_model(cfg, torch_dtype=None).cuda().eval()
-        logger.info("model ready in %.1fs", time.time() - t0)
+        process.start()
+        child.close()
+        self._worker, self._connection = process, parent
+        if not parent.poll(self._WORKER_TIMEOUT_S):
+            self._stop_worker_locked()
+            raise TimeoutError("Pi0.5 model worker startup timed out")
+        status, payload = parent.recv()
+        if status != "ready":
+            self._stop_worker_locked()
+            raise RuntimeError(f"Pi0.5 model worker failed: {payload}")
 
-    # ---- inference ----
+    def unload(self) -> dict[str, bool]:
+        with self._worker_lock:
+            self._stop_worker_locked()
+        return {"loaded": False}
+
+    def _register_rpc(self):
+        super()._register_rpc()
+        self._rpc["vla.unload"] = self.unload
 
     def predict(self, obs: dict, options: dict | None = None) -> np.ndarray:
-        """Run one inference and return the action ndarray.
-
-        The caller (client) is responsible for encoding env-native obs into
-        the openpi wire format (see ``Pi05VLAClient.encode_obs``).
-        """
         mode = (options or {}).get("mode", "eval")
-        with torch.no_grad():
-            actions, _ = self._model.predict_action_batch(obs, mode=mode)
-        return (
-            actions.detach().cpu().numpy()
-            if (
-                hasattr(actions, "detach")
-                and hasattr(actions, "cpu")
-                and hasattr(actions, "numpy")
-            )
-            else np.asarray(actions)
-        ).astype(np.float32)
+        with self._worker_lock:
+            self._ensure_worker_locked()
+            assert self._connection is not None
+            self._connection.send(("predict", (obs, mode)))
+            if not self._connection.poll(self._WORKER_TIMEOUT_S):
+                self._stop_worker_locked()
+                raise TimeoutError("Pi0.5 prediction timed out")
+            status, payload = self._connection.recv()
+            if status != "ok":
+                self._stop_worker_locked()
+                raise RuntimeError(f"Pi0.5 prediction worker failed: {payload}")
+            return np.asarray(payload, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
