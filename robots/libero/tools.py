@@ -83,8 +83,20 @@ class LiberoPrimitives:
         self._frames = []
 
     def record_frame(self, obs):
-        """Append one agentview frame extracted from ``obs`` to the buffer."""
-        self._frames.append(np.ascontiguousarray(np.asarray(obs["main_images"])))
+        """Append one valid uint8 HWC agentview frame extracted from ``obs``."""
+        image = obs.get("main_images") if isinstance(obs, dict) else None
+        if image is None:
+            return
+        frame = np.asarray(image)
+        if frame.ndim == 4 and frame.shape[0] == 1:
+            frame = frame[0]
+        if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
+            return
+        if frame.dtype != np.uint8:
+            if not np.isfinite(frame).all():
+                return
+            frame = np.clip(frame * 255 if frame.max(initial=0) <= 1 else frame, 0, 255).astype(np.uint8)
+        self._frames.append(np.ascontiguousarray(frame[..., :3]))
 
     def recorded_frame_count(self) -> int:
         return len(self._frames)
@@ -731,6 +743,10 @@ class LiberoPrimitives:
             }
 
         try:
+            self.model.unload()
+        except Exception:
+            pass
+        try:
             data = self._sam3_client.segment(
                 state.load_bytes(image_name, step=nn),
                 text_prompt=prompt if has_prompt else None,
@@ -753,6 +769,10 @@ class LiberoPrimitives:
                 "fallback": "Use manual visual localization and back_project.",
             }
 
+        try:
+            self._sam3_client.unload()
+        except Exception:
+            pass
         segment_index = _next_segment_index(record)
         segment_name = f"segment_{segment_index:02d}.json"
         overlay_name = f"segment_overlay_{segment_index:02d}.png"

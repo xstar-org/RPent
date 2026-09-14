@@ -145,3 +145,9 @@ class Sam3Client:
             mask=mask,
             mask_shape=expected_shape,
         )
+
+
+def _release_sam3(self) -> None:
+    self._client.call("unload", kwargs={}, timeout_s=self._timeout_s)
+
+Sam3Client.unload = _release_sam3

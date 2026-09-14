@@ -221,12 +221,22 @@ class LiberoToolkit(Toolkit):
             logger.warning("failed to finalize flywheel episode: %s", e)
 
         try:
-            frames = self._primitives.stop_recording()
+            frames = [
+                frame
+                for frame in (self._primitives.stop_recording() or [])
+                if frame is not None
+            ]
+            if not frames:
+                try:
+                    latest = self._state.load("agentview.png")
+                except Exception:
+                    latest = None
+                frames = [latest] if latest is not None else []
             if frames:
                 self._state.save("episode.mp4", frames, step=None, fps=20)
+            else:
+                logger.warning("no LIBERO frames available for episode video")
         except Exception as e:
-            # The runner is in the cleanup path; never let a video save
-            # abort it.
             logger.warning(f"failed to save episode video: {e}")
 
     def solved(self) -> bool:

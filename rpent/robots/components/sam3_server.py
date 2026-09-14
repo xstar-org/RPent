@@ -31,6 +31,7 @@ import base64
 import hashlib
 import io
 import logging
+import multiprocessing
 import os
 import threading
 from contextlib import nullcontext
@@ -294,16 +295,43 @@ class Sam3Engine:
         )
 
 
-class Sam3Facade(RpcFacade):
-    """Expose :class:`Sam3Engine` through the shared RPC transports."""
+def _segment_worker(checkpoint: str, request: dict[str, Any], connection) -> None:
+    """Run one SAM3 request in a disposable CUDA process."""
+    try:
+        response = Sam3Engine.load(checkpoint).segment(
+            request["image_bytes"],
+            text_prompt=request["text_prompt"],
+            point=request["point"],
+            min_score=request["min_score"],
+        )
+        connection.send(("ok", response.model_dump(exclude_none=True)))
+    except BaseException as exc:
+        connection.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        connection.close()
 
-    def __init__(self, engine: Sam3Engine) -> None:
+
+class Sam3Facade(RpcFacade):
+    """Expose SAM3 while isolating every CUDA inference in a child process."""
+
+    _WORKER_TIMEOUT_S = 115.0
+
+    def __init__(self, checkpoint: str) -> None:
         super().__init__()
-        self._engine = engine
+        self._checkpoint = checkpoint
+        self._segment_lock = threading.Lock()
+        self._process_context = multiprocessing.get_context("spawn")
+
+    def unload(self) -> dict[str, bool]:
+        # CUDA lives only in disposable segment workers; there is no resident
+        # model in the RPC parent process.
+        return {"loaded": False}
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method == "segment":
             return self.segment(*args, **kwargs)
+        if method == "unload":
+            return self.unload()
         return super()._dispatch(method, args, kwargs)
 
     def segment(
@@ -323,13 +351,36 @@ class Sam3Facade(RpcFacade):
         image_bytes = base64.b64decode(request.image_base64, validate=True)
         if not image_bytes:
             raise ValueError("image_base64 is empty")
-        response = self._engine.segment(
-            image_bytes,
-            text_prompt=request.text_prompt,
-            point=request.point,
-            min_score=request.min_score,
-        )
-        return response.model_dump(exclude_none=True)
+        worker_request = {
+            "image_bytes": image_bytes,
+            "text_prompt": request.text_prompt,
+            "point": request.point,
+            "min_score": request.min_score,
+        }
+        with self._segment_lock:
+            receive, send = self._process_context.Pipe(duplex=False)
+            process = self._process_context.Process(
+                target=_segment_worker,
+                args=(self._checkpoint, worker_request, send),
+                daemon=True,
+            )
+            process.start()
+            send.close()
+            try:
+                if not receive.poll(self._WORKER_TIMEOUT_S):
+                    raise TimeoutError("SAM3 segment worker timed out")
+                status, payload = receive.recv()
+            except EOFError as exc:
+                raise RuntimeError("SAM3 segment worker exited without a response") from exc
+            finally:
+                receive.close()
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+            if status != "ok":
+                raise RuntimeError(f"SAM3 segment worker failed: {payload}")
+            return payload
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -371,8 +422,7 @@ def main() -> None:
             "SAM3_CHECKPOINT_PATH is not set; export the path to sam3.pt "
             "before starting RPent"
         )
-    engine = Sam3Engine.load(checkpoint)
-    facade = Sam3Facade(engine)
+    facade = Sam3Facade(checkpoint)
     facade.serve(
         transport=args.transport,
         host=args.host,

@@ -191,6 +191,7 @@ class _HttpRpcHandler(BaseHTTPRequestHandler):
                 )
             response: dict = {"ok": True, "result": result}
         except Exception as exc:
+            logger.exception("RPC method %s failed", method if "method" in locals() else "<invalid>")
             response = make_error_response(exc)
 
         # Always 200; failures are described inside the body via ok=False.

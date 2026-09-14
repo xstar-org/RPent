@@ -317,16 +317,6 @@ def main():
         # (which inherit the env). Pin the two backends directly instead:
         #   - MuJoCo render device <- MUJOCO_EGL_DEVICE_ID (configure_egl_device)
         #   - torch default device  <- torch.cuda.set_device(N)
-        prev = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if prev is not None:
-            logger.warning(
-                "CUDA_VISIBLE_DEVICES=%s is set; clearing it and pinning via "
-                "MUJOCO_EGL_DEVICE_ID + torch.cuda.set_device(--cuda-device=%s) "
-                "instead (robosuite's CVD assertion is incompatible with EGL<->CUDA mapping)",
-                prev,
-                args.cuda_device,
-            )
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         from rpent.utils.egl import configure_egl_device
 
         configure_egl_device(args.cuda_device)
