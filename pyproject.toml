@@ -129,6 +129,12 @@ robotwin = [
     "rlinf-lingbotvla==0.1.1",
     "nvidia-curobo @ git+https://github.com/NVlabs/curobo.git@v0.7.8",
 ]
+# The RoboDojo runtime (Isaac Sim 5.1 / IsaacLab / XPolicyLab) is not
+# pip-installable alongside RPent: it lives in its own shared-storage venv on
+# the deployment host, and robots/robodojo/env_server.py is launched with that
+# venv's interpreter. This extra is intentionally dependency-free; it only
+# marks the planner-side variant (rpent core is enough to drive it).
+robodojo = []
 
 [tool.uv]
 prerelease = "allow"
